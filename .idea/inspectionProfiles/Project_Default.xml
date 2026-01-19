@@ -1,0 +1,68 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <value>
+          <list size="10">
+            <item index="0" class="java.lang.String" itemvalue="mxnet-cu100" />
+            <item index="1" class="java.lang.String" itemvalue="tensorflow" />
+            <item index="2" class="java.lang.String" itemvalue="tables" />
+            <item index="3" class="java.lang.String" itemvalue="future" />
+            <item index="4" class="java.lang.String" itemvalue="pandas" />
+            <item index="5" class="java.lang.String" itemvalue="scipy" />
+            <item index="6" class="java.lang.String" itemvalue="scikit_learn" />
+            <item index="7" class="java.lang.String" itemvalue="matplotlib" />
+            <item index="8" class="java.lang.String" itemvalue="torch" />
+            <item index="9" class="java.lang.String" itemvalue="numpy" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyPep8NamingInspection" enabled="true" level="WEAK WARNING" enabled_by_default="true">
+      <option name="ignoredErrors">
+        <list>
+          <option value="N801" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyUnresolvedReferencesInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredIdentifiers">
+        <list>
+          <option value="pandas" />
+          <option value="mxnet" />
+          <option value="numpy" />
+          <option value="argparse" />
+          <option value="json" />
+          <option value="time" />
+          <option value="os" />
+          <option value="main_4n0_3layer_12T_res.str" />
+          <option value="main_4n0_3layer_12T_res.open" />
+          <option value="main_4n0_3layer_12T_res.print" />
+          <option value="main_4n0_3layer_12T_res.isinstance" />
+          <option value="main_4n0_3layer_12T_res.list" />
+          <option value="main_4n0_3layer_12T_res.enumerate" />
+          <option value="main_4n0_3layer_12T_res.int" />
+          <option value="main_4n0_3layer_12T_res.dict" />
+          <option value="main_4n0_3layer_12T_res.zip" />
+          <option value="main_4n0_3layer_12T_res.min" />
+          <option value="main_4n0_3layer_12T_res.range" />
+          <option value="utils_4n0_3layer_12T_res.print" />
+          <option value="csv" />
+          <option value="utils_4n0_3layer_12T_res.int" />
+          <option value="utils_4n0_3layer_12T_res.open" />
+          <option value="utils_4n0_3layer_12T_res.enumerate" />
+          <option value="utils_4n0_3layer_12T_res.float" />
+          <option value="utils_4n0_3layer_12T_res.len" />
+          <option value="utils_4n0_3layer_12T_res.ValueError" />
+          <option value="utils_4n0_3layer_12T_res.type" />
+          <option value="utils_4n0_3layer_12T_res.range" />
+          <option value="utils_4n0_3layer_12T_res.KeyError" />
+          <option value="data.Temporal_Graph_gen.range" />
+          <option value="data.Temporal_Graph_gen.min" />
+          <option value="data.Temporal_Graph_gen.max" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
