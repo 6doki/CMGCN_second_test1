@@ -8,11 +8,12 @@ import json
 from Data.dataset.stfgnn_dataset import STFGNNDataset
 from model_DAGCN.compute_delay import COMPUTE_delay
 from model.STFGNN import STFGNN
+from model_DAGCN.DAGCN import DAGCN
 from executor.multi_step_executor import MultiStepExecutor as STFGNNExecutor
 
 if __name__ == '__main__':
     config = {}  # 空的字典，用来存储配置文件中的配置信息
-    for filename in ["config/PEMS08_10.json", "config/STFGNN.json"]:
+    for filename in ["config/PEMS04.json", "config/DAGCN.json"]:
         with open(filename, "r") as f: # 打开配置文件之后将其文件对象赋值给f
             _config = json.load(f)     # 将f中的JSON内容加载到_config字典中，该字典存储了当前文件中的所有配置项
             for key in _config:        # 遍历字典中的每一个键
@@ -48,7 +49,6 @@ if __name__ == '__main__':
     # 调用方法查看数据加载器和特征
     train_data, valid_data, test_data = dataset.get_data()  # DataLoader
 
-
     #  查看所有属性及其值
     # print("Dataset Attributes:", dataset.__dict__)
 
@@ -59,10 +59,16 @@ if __name__ == '__main__':
     # model_cache_file = 'cache/model_cache/PEMS0430_STFGNN.m'
     # model_cache_file = 'cache/model_cache/PEMS08_STFGNN.m'
     # model_cache_file = 'cache/model_cache/PEMS0810_STFGNN.m'
-    model_cache_file = 'cache/model_cache/PEMS08_STFGNN_UPDATE.m'
-    model = STFGNN(config, data_feature)
+    # model_cache_file = 'cache/model_cache/PEMS0810_STFGNN_UPDATE_0122.m'
+    # model_cache_file = 'cache/model_cache/PEMS04_DAGCN_0126_epoch20.m'
+    # model_cache_file = 'cache/model_cache/PEMS04_DAGCN_0126_epoch200.m'
+    # model_cache_file = 'cache/model_cache/PEMS04_DAGCN_0127_epoch50.m'
+    model_cache_file = 'cache/model_cache/PEMS04_DAGCN_0128_epoch200.m'
 
-    executor = STFGNNExecutor(config, model) # 使用自己定义的评估模型
+    # model = STFGNN(config, data_feature)
+    model = DAGCN(config, data_feature)
+
+    executor = STFGNNExecutor(config, model)   # 使用自己定义的评估模型
     train = True  # 标识是否需要重新训练
 
     if train or not os.path.exists(model_cache_file):

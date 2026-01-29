@@ -26,7 +26,7 @@
 
     "train_loss": "mae",
     "clip": 10,
-    "epochs": 20,
+    "epochs": 200,
     "seed": 54321,
     "log_interval": 2000,
     "optim": "adam",

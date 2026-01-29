@@ -243,7 +243,7 @@ class STFGNNDataset(MultiStepDataset):
             三维数组：(时间步总数,节点数量,节点特征)
             data[0]:时间步总数
             data[1]:节点数量
-            data[2]:节点特征数量
+            data[2]:节点特征数量  data = self.rawdat[:, :, 3]
             '''
             data = self.rawdat[:, :, 0]  # 取数据集中的所有时间步的每个节点的第一个节点特征  data:(时间步总数,节点数) 二维数据
             total_day = data.shape[0] / 288  # 时间步总数/每天的时间步数量=总的天数:91 days

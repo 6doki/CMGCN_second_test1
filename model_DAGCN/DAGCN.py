@@ -2,7 +2,160 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import numpy as np
+import scipy.sparse as sp
+from scipy.sparse.linalg import eigsh
 
+
+def compute_laplacian_pe(adj_mx, max_freqs=10):
+    """
+    计算拉普拉斯位置编码 (Laplacian PE)
+    :param adj_mx: 邻接矩阵 (N, N)
+    :param max_freqs: 保留前k个特征向量 (用于降维)
+    :return: torch.Tensor (N, max_freqs)
+    """
+    # 1. 确保是 numpy 矩阵
+    if isinstance(adj_mx, torch.Tensor):
+        adj_mx = adj_mx.cpu().numpy()
+
+    N = adj_mx.shape[0]
+
+    # 2. 计算归一化拉普拉斯矩阵 L = I - D^-1/2 * A * D^-1/2
+    # 添加自环
+    adj_mx = adj_mx + np.eye(N)
+    # 度矩阵
+    d = np.sum(adj_mx, axis=1)
+    d_inv_sqrt = np.power(d, -0.5)
+    d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+    d_mat_inv_sqrt = np.diag(d_inv_sqrt)
+
+    # 对称归一化邻接矩阵
+    sym_adj = adj_mx.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt)
+
+    # 拉普拉斯矩阵
+    L = np.eye(N) - sym_adj
+
+    # 3. 特征分解 (Eigendecomposition)
+    # 使用 scipy 计算最小的 k 个特征值和特征向量
+    # k = max_freqs
+    try:
+        # eigsh 用于稀疏/实对称矩阵，'SM' 表示 Smallest Magnitude (最小特征值)
+        eigenvals, eigenvecs = eigsh(L, k=max_freqs + 1, which='SM')
+        # 第一个特征向量通常是常数向量 (对应特征值0)，一般丢弃或保留均可
+        # 这里取后 max_freqs 个
+        pe = eigenvecs[:, 1:]
+    except:
+        # 如果特征分解失败 (极少情况)，用随机初始化兜底
+        print("Warning: Laplacian decomposition failed, using random PE.")
+        pe = np.random.randn(N, max_freqs)
+
+    return torch.FloatTensor(pe)
+
+
+class AdvancedDataEmbedding(nn.Module):
+    """
+    创新点三：增强型数据嵌入
+    包含：Input Projection + Laplacian PE + Learnable Temporal/Spatial Embedding
+    """
+
+    def __init__(self, input_dim, embed_dim, adj_mx, num_nodes, dropout=0.1):
+        super(AdvancedDataEmbedding, self).__init__()
+
+        # 1. 原始输入投影 (1 -> 64)
+        self.input_proj = nn.Linear(input_dim, embed_dim)
+
+        # 2. 拉普拉斯位置编码 (Spatial Structure)
+        # 预先计算好 PE
+        self.pe_dim = 8  # 取前8个特征向量
+        pe = compute_laplacian_pe(adj_mx, max_freqs=self.pe_dim)
+        # 注册为 buffer，不参与梯度更新，但随模型移动设备
+        self.register_buffer('laplacian_pe', pe)
+        # 将 PE 映射到 embed_dim
+        self.pe_proj = nn.Linear(self.pe_dim, embed_dim)
+
+        # 3. 可学习的时间/空间嵌入 (辅助)
+        # 既然没有具体的 time_of_day 数据，我们用可学习的参数来增强
+        self.node_emb = nn.Parameter(torch.randn(num_nodes, embed_dim))
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """
+        x: (B, T, N, Cin)
+        """
+        # A. 基础特征映射
+        val_emb = self.input_proj(x)  # (B, T, N, D)
+
+        # B. 注入拉普拉斯空间信息
+        # laplacian_pe: (N, 8) -> (N, D)
+        pe_feat = self.pe_proj(self.laplacian_pe)
+        # 扩展维度以相加: (1, 1, N, D)
+        pe_feat = pe_feat.unsqueeze(0).unsqueeze(0)
+
+        # C. 注入可学习节点嵌入
+        node_feat = self.node_emb.unsqueeze(0).unsqueeze(0)  # (1, 1, N, D)
+
+        # D. 融合
+        # 原始数值 + 结构信息 + 节点身份
+        out = val_emb + pe_feat + node_feat
+
+        return self.dropout(out)
+
+
+class GlobalTemporalTransformer(nn.Module):
+    """
+    创新点二：全局时间 Transformer
+    用于捕捉长距离的时间依赖，弥补 CMGCN 滑动窗口的"近视"问题。
+    """
+
+    def __init__(self, in_dim, num_heads=2, dropout=0.1):
+        super(GlobalTemporalTransformer, self).__init__()
+        self.num_heads = num_heads
+        self.in_dim = in_dim
+
+        # 多头自注意力层 (Temporal Self-Attention)
+        # batch_first=True 表示输入格式为 (Batch, Seq_Len, Feature)
+        self.attention = nn.MultiheadAttention(embed_dim=in_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+
+        # 前馈网络 (Feed Forward Network)
+        self.ffn = nn.Sequential(
+            nn.Linear(in_dim, in_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(in_dim * 2, in_dim)
+        )
+
+        # 层归一化 (LayerNorm)
+        self.norm1 = nn.LayerNorm(in_dim)
+        self.norm2 = nn.LayerNorm(in_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        """
+        :param x: (Batch, N, T, C) 注意这里的 T 是全局时间步
+        """
+        B, N, T, C = x.shape
+
+        # 1. 维度变换：合并 Batch 和 Node，把 Time 独立出来做 Attention
+        # (B, N, T, C) -> (B*N, T, C)
+        x_reshaped = x.reshape(B * N, T, C)
+
+        # 2. Self-Attention 计算
+        # attn_output: (B*N, T, C)
+        attn_output, _ = self.attention(x_reshaped, x_reshaped, x_reshaped)
+
+        # 3. 残差连接 + Norm
+        x_res = self.norm1(x_reshaped + self.dropout(attn_output))
+
+        # 4. FFN + 残差连接 + Norm
+        ffn_output = self.ffn(x_res)
+        x_out = self.norm2(x_res + self.dropout(ffn_output))
+
+        # 5. 还原维度
+        # (B*N, T, C) -> (B, N, T, C)
+        x_out = x_out.reshape(B, N, T, C)
+
+        return x_out
 
 class DelayAware_gcn_operation(nn.Module):
     def __init__(self, adj, in_dim, out_dim, num_vertices, patterns, activation='GLU'):
@@ -26,14 +179,17 @@ class DelayAware_gcn_operation(nn.Module):
         self.num_patterns = patterns.shape[0]
         self.pattern_len = patterns.shape[1]
 
-        # 投影层:将输入特征映射到pattern相同的维度以便计算相似度
-        self.self.query_proj = nn.Linear(in_dim, self.pattern_len)
+        # # 投影层:将输入特征映射到pattern相同的维度以便计算相似度
+        # self.query_proj = nn.Linear(in_dim, self.pattern_len)
 
         # 模式特征提取层：将匹配到的Pattern映射回输入特征维度
-        self.pattern_conv = nn.Linear(self.pattern_len, in_dim)
+        # self.pattern_conv = nn.Linear(self.pattern_len, in_dim)
+        self.pattern_embed = nn.Linear(self.pattern_len, in_dim)
 
         # 融合门控机制：决定保留多少原特征，注入多少模式特征
         self.fusion_gate = nn.Linear(in_dim * 2, out_dim)
+        # 初始化偏置，使 sigmoid(fusion_gate) 初始值很小，优先保留原始特征
+        nn.init.constant_(self.fusion_gate.bias, -2.0)
 
         assert self.activation in {'GLU', 'relu'}
         if self.activation == 'GLU':
@@ -41,57 +197,115 @@ class DelayAware_gcn_operation(nn.Module):
         else:
             self.FC = nn.Linear(self.in_dim, self.out_dim, bias=True)
 
-    def forward(self, x, mask=None):
+    # def forward(self, x, pattern_weight, mask=None):
+    #
+    #
+    #     # 模式匹配
+    #     x_tmp = x.permute(1, 0, 2)  # 调整维度以便计算: (N, B, C) -> (B, N, C)
+    #
+    #     # 将输入特征投影为 Query: (B, N, Pattern_Len)
+    #     query = self.query_proj(x_tmp)
+    #
+    #     # 计算与所有 Patterns 的相似度 (点积)
+    #     # patterns: (K, Pattern_Len) -> 转置 (Pattern_Len, K)
+    #     # score: (B, N, K) 表示每个节点当前时刻与 K 个模式的匹配程度
+    #     score = torch.matmul(query, self.patterns.t())
+    #     attn = torch.softmax(score, dim=-1)  # 归一化权重
+    #
+    #     # 加权组合最匹配的 Patterns
+    #     # (B, N, K) * (K, Pattern_Len) -> (B, N, Pattern_Len)
+    #     matched_pattern_feat = torch.matmul(attn, self.patterns)
+    #
+    #     # 映射回特征维度: (B, N, In_Dim)
+    #     delay_feat = self.pattern_conv(matched_pattern_feat)
+    #
+    #     # --- 过程 2: 特征融合 ---
+    #     # 拼接原特征和延迟特征
+    #     combined = torch.cat([x_tmp, delay_feat], dim=-1)
+    #     # 计算门控值 (0~1)
+    #     z = torch.sigmoid(self.fusion_gate(combined))
+    #     # 融合：原特征 * z + 延迟特征 * (1-z)
+    #     x_enhanced = x_tmp * z + delay_feat * (1 - z)
+    #
+    #     # 转回原维度 (N, B, C) 以便进行后续的 GCN 操作
+    #     x = x_enhanced.permute(1, 0, 2)
+    #
+    #     adj = self.adj
+    #     '''如果提供了mask，将邻接矩阵adj移动到与mask相同的设备上，并乘以mask，将无效节点对应的邻接关系置0，从而忽略掉那些不应考虑的边'''
+    #     if mask is not None:
+    #         adj = adj.to(mask.device) * mask
+    #
+    #     x = torch.einsum('nm, mbc->nbc', adj.to(x.device), x)  # 4*N, B, Cin  对邻接矩阵adj(维度nm)和特征矩阵x(维度mbc)进行乘法操作
+    #
+    #     if self.activation == 'GLU':
+    #         lhs_rhs = self.FC(x)  # 全连接层输出：(4*N, B, 2*Cout)
+    #         lhs, rhs = torch.split(lhs_rhs, self.out_dim, dim=-1)  # 拆分之后的lhs和rhs:(4*N, B, Cout)
+    #         out = lhs * torch.sigmoid(rhs)
+    #         del lhs, rhs, lhs_rhs
+    #         return out
+    #     elif self.activation == 'relu':
+    #         return torch.relu(self.FC(x))  # 3*N, B, Cout
 
-        # 模式匹配
-        x_tmp = x.permute(1, 0, 2)  # 调整维度以便计算: (N, B, C) -> (B, N, C)
+    def forward(self, x, pattern_weights, mask=None):
+        """
+        :param x: (3*N, B, Cin)
+        :param pattern_weights: (B, N, K) 从最顶层传下来的权重
+        """
+        # 1. 准备 Pattern 特征
+        # patterns: (K, L) -> pattern_embed -> (K, Cin)
+        # 这一步将固定的 Pattern 投影到当前的特征空间
+        projected_patterns = self.pattern_embed(self.patterns)
 
-        # 将输入特征投影为 Query: (B, N, Pattern_Len)
-        query = self.query_proj(x_tmp)
+        # 2. 根据权重聚合特征
+        # pattern_weights: (B, N, K)
+        # projected_patterns: (K, Cin)
+        # matmul -> (B, N, Cin)
 
-        # 计算与所有 Patterns 的相似度 (点积)
-        # patterns: (K, Pattern_Len) -> 转置 (Pattern_Len, K)
-        # score: (B, N, K) 表示每个节点当前时刻与 K 个模式的匹配程度
-        score = torch.matmul(query, self.patterns.t())
-        attn = torch.softmax(score, dim=-1)  # 归一化权重
+        # 3. 维度对齐
+        # GCN 的输入 x 是 (3N, B, Cin)，这里的 3N 是 (N_t, N_t+1, N_t+2)
+        # 我们假设节点的 Pattern 在这 3 个时间步内是共享的
+        # 所以我们需要把 delay_feat (B, N, Cin) 扩展为 (B, 3N, Cin)
+        total_gcn_nodes = x.shape[0]  # 获取当前的节点总数 (例如 1228)
+        original_nodes = pattern_weights.shape[1]  # 获取原始节点数 (例如 307)
 
-        # 加权组合最匹配的 Patterns
-        # (B, N, K) * (K, Pattern_Len) -> (B, N, Pattern_Len)
-        matched_pattern_feat = torch.matmul(attn, self.patterns)
+        # 自动计算倍数 (1228 // 307 = 4)
+        if original_nodes > 0:
+            repeat_factor = total_gcn_nodes // original_nodes
+        else:
+            repeat_factor = 1  # 防止除零，虽然理论上不会发生
+        delay_feat = torch.matmul(pattern_weights, projected_patterns)
+        # 动态复制
+        delay_feat = delay_feat.repeat(1, repeat_factor, 1)
 
-        # 映射回特征维度: (B, N, In_Dim)
-        delay_feat = self.pattern_conv(matched_pattern_feat)
+        # 调整为 (3N, B, Cin) 以匹配 x
+        delay_feat = delay_feat.permute(1, 0, 2)
 
-        # --- 过程 2: 特征融合 ---
-        # 拼接原特征和延迟特征
-        combined = torch.cat([x_tmp, delay_feat], dim=-1)
-        # 计算门控值 (0~1)
+        # 4. 融合
+        # 拼接
+        combined = torch.cat([x, delay_feat], dim=-1)
+        # 计算门控 (B, 3N, Cin)
         z = torch.sigmoid(self.fusion_gate(combined))
-        # 融合：原特征 * z + 延迟特征 * (1-z)
-        x_enhanced = x_tmp * z + delay_feat * (1 - z)
 
-        # 转回原维度 (N, B, C) 以便进行后续的 GCN 操作
-        x = x_enhanced.permute(1, 0, 2)
+        # 残差融合：原特征 + 门控 * 延迟特征
+        # 这样如果 z 接近 0，就退化为原始 GCN，保证下限
+        x_enhanced = x + z * delay_feat
 
+        # 5. GCN 操作 (不变)
         adj = self.adj
-        '''如果提供了mask，将邻接矩阵adj移动到与mask相同的设备上，并乘以mask，将无效节点对应的邻接关系置0，从而忽略掉那些不应考虑的边'''
         if mask is not None:
             adj = adj.to(mask.device) * mask
-
-        x = torch.einsum('nm, mbc->nbc', adj.to(x.device), x)  # 4*N, B, Cin  对邻接矩阵adj(维度nm)和特征矩阵x(维度mbc)进行乘法操作
+        x_out = torch.einsum('nm, mbc->nbc', adj.to(x_enhanced.device), x_enhanced)
 
         if self.activation == 'GLU':
-            lhs_rhs = self.FC(x)  # 全连接层输出：(4*N, B, 2*Cout)
-            lhs, rhs = torch.split(lhs_rhs, self.out_dim, dim=-1)  # 拆分之后的lhs和rhs:(4*N, B, Cout)
-            out = lhs * torch.sigmoid(rhs)
-            del lhs, rhs, lhs_rhs
-            return out
+            lhs_rhs = self.FC(x_out)
+            lhs, rhs = torch.split(lhs_rhs, self.out_dim, dim=-1)
+            return lhs * torch.sigmoid(rhs)
         elif self.activation == 'relu':
-            return torch.relu(self.FC(x))  # 3*N, B, Cout
+            return torch.relu(self.FC(x_out))
 
 
 class STSGCM(nn.Module):
-    def __init__(self, adj, in_dim, out_dims, num_of_vertices, activation='GLU'):
+    def __init__(self, adj, in_dim, out_dims, num_of_vertices, patterns, activation='GLU'):
         """
         :param adj: 邻接矩阵
         :param in_dim: 输入维度
@@ -105,31 +319,34 @@ class STSGCM(nn.Module):
         self.out_dims = out_dims    # out_dims：[64,64,64]
         self.num_of_vertices = num_of_vertices  # N
         self.activation = activation
+        self.patterns = patterns
         self.gcn_operations = nn.ModuleList()  # 先初始化一个模块列表，用于存储多个gcn_operation
 
         '''第一个gcn_operation'''
         self.gcn_operations.append(   # 第0个
-            gcn_operation(
+            DelayAware_gcn_operation(
                 adj=self.adj,
                 in_dim=self.in_dim,
                 out_dim=self.out_dims[0],  # out_dims[0]：64
                 num_vertices=self.num_of_vertices,
-                activation=self.activation
+                activation=self.activation,
+                patterns=self.patterns
             )
         )
         '''剩下的gcn_operations'''
         for i in range(1, len(self.out_dims)):  # 第1-2个
             self.gcn_operations.append(
-                gcn_operation(
+                DelayAware_gcn_operation(
                     adj=self.adj,
                     in_dim=self.out_dims[i-1],  # 输入：前一个图卷积操作的输出维度
                     out_dim=self.out_dims[i],   # 输出：64
                     num_vertices=self.num_of_vertices,
-                    activation=self.activation
+                    activation=self.activation,
+                    patterns=self.patterns
                 )
             )
 
-    def forward(self, x, mask=None):
+    def forward(self, x, pattern_weights, mask=None):
         """
         :param x: (3N, B, Cin)
         :param mask: (3N, 3N)
@@ -138,7 +355,7 @@ class STSGCM(nn.Module):
         need_concat = []  # 空列表，用于存储每个gcn_operation的输出
 
         for i in range(len(self.out_dims)):
-            x = self.gcn_operations[i](x, mask)     # 4N, B, Cin
+            x = self.gcn_operations[i](x, pattern_weights, mask)     # 4N, B, Cin
             need_concat.append(x)
 
         # shape of each element is (1, N, B, Cout)
@@ -162,6 +379,7 @@ class STSGCL(nn.Module):
                  num_of_vertices,
                  in_dim,
                  out_dims,
+                 patterns,
                  strides=4,
                  activation='GLU',
                  # temporal_emb=False,
@@ -182,6 +400,7 @@ class STSGCL(nn.Module):
         """
         super(STSGCL, self).__init__()
         print("-------------------进入STSGCL---------------------")
+        self.patterns = patterns
         self.adj = adj  # (4N,4N)
         self.strides = strides  # 4
         self.history = history  # 12
@@ -196,6 +415,19 @@ class STSGCL(nn.Module):
         # self.conv1 = nn.Conv2d(self.in_dim, self.out_dims[-1], kernel_size=(1, 2), stride=(1, 1), dilation=(1, 1))
         # self.conv2 = nn.Conv2d(self.in_dim, self.out_dims[-1], kernel_size=(1, 2), stride=(1, 1), dilation=(1, 1))
 
+
+        "--- [创新点二新增] 全局 Transformer 分支 ---"
+        # 它的输入维度是 in_dim，输出维度也是 in_dim (为了方便残差融合)
+        self.global_transformer = GlobalTemporalTransformer(in_dim=in_dim, num_heads=2)
+
+        # 降维/对齐层：
+        # 因为 STSGCM (局部GCN) 会改变通道数 (例如 64->64)，
+        # 如果 GCN 的输出维度 out_dims[-1] 和输入 in_dim 不一样，我们需要一个线性层来对齐
+        if in_dim != out_dims[-1]:
+            self.align_proj = nn.Linear(in_dim, out_dims[-1])
+        else:
+            self.align_proj = None
+
         self.STSGCMS = nn.ModuleList()
         for i in range(self.history - self.strides + 1):    # (0,...,8)
             self.STSGCMS.append(
@@ -203,6 +435,7 @@ class STSGCL(nn.Module):
                     adj=self.adj,
                     in_dim=self.in_dim,
                     out_dims=self.out_dims,
+                    patterns = self.patterns,
                     num_of_vertices=self.num_of_vertices,
                     activation=self.activation
                 )
@@ -227,64 +460,114 @@ class STSGCL(nn.Module):
         if self.spatial_emb:
             nn.init.xavier_normal_(self.spatial_embedding, gain=0.0003)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, pattern_weights, mask=None):
         """
-        :param x: B, T, N, Cin    (x数据：表示有B个批次，每个批次有T个时间步，每个时间步有N个节点，输入特征维度是Cin)
-        :param mask: (N, N)
-        :return: B, T-3, N, Cout  (输出out数据:表示有B个批次，每个批次有T-3个时间步，每个时间步有N个节点，输出特征维度是Cout)
+        x: (B, T, N, C)
         """
-        # 消融
-        if self.temporal_emb:   # x: B=64, T=12, N, Cin=64      temporal_embedding:1, history=12, 1, Cin=64
-            x = x + self.temporal_embedding     # x: B=64, T=12, N, Cin=64
+        # ... (原有代码: Embedding 叠加，保持不变) ...
+        if self.temporal_emb:
+            x = x + self.temporal_embedding
+        if self.spatial_emb:
+            x = x + self.spatial_embedding
 
-        if self.spatial_emb:    # 1, 1, N, Cin=64   spatial_embedding: 1, 1, N , Cin=64
-            x = x + self.spatial_embedding      # x: B=64, T=12, N, Cin=64
-
-        #############################################
-        # shape is (B, C, N, T)
-        '''
-        下面代码对应论文中：两个二维的扩张卷积神经网络（捕获全局的）
-        '''
-        data_temp = x.permute(0, 3, 2, 1)                 # 交换位置x(B=64, Cin=64, N, T=12)
-        data_left = torch.sigmoid(self.conv1(data_temp))  # (64, 64, 358, 9)
-        data_right = torch.tanh(self.conv2(data_temp))    # (64, 64, 358, 9)
-        data_time_axis = data_left * data_right           # (64, 64, 358, 9)
-        data_res = data_time_axis.permute(0, 3, 2, 1)     # (64,9,358,64) 再次交换位置:(B,T-3,N,Cin)
-        # shape is (B, T-3, N, C)
-        #############################################
-
+        # ==================== 分支 1: 局部滑动窗口 GCN (原 CMGCN 逻辑) ====================
         need_concat = []
-        batch_size = x.shape[0]  # 64
+        batch_size = x.shape[0]
 
+        # 这是一个滑动窗口循环，比如 T=12, strides=3, 循环会执行 T-3+1 次
         for i in range(self.history - self.strides + 1):
-            t = x[:, i: i+self.strides, :, :]  # 从x中提取一个滑动窗口:t(B, self.stride, N, Cin),这里stride=4
-            t = torch.reshape(t, shape=[batch_size, self.strides * self.num_of_vertices, self.in_dim])   #将t重塑为(B, self.stride*N, Cin)
-            # (B, 4*N, Cin)
-            t = self.STSGCMS[i](t.permute(1, 0, 2), mask)  # (4*N, B, Cin) -> (N, B, Cout)
-            t = torch.unsqueeze(t.permute(1, 0, 2), dim=1)  # (N, B, Cout) -> (B, N, Cout) ->(B, 1, N, Cout)
+            t = x[:, i: i + self.strides, :, :]  # 切片: 取局部 3 个时间步
+
+            # 变形为 (B, 3N, C) 送入 GCN
+            t = torch.reshape(t, shape=[batch_size, self.strides * self.num_of_vertices, self.in_dim])
+
+            # GCN 运算
+            t = self.STSGCMS[i](t.permute(1, 0, 2), pattern_weights, mask)
+
+            # 还原形状 (N, B, Cout) -> (B, N, Cout)
+            t = t.permute(1, 0, 2)
+            t = torch.unsqueeze(t, dim=1)  # (B, 1, N, Cout)
             need_concat.append(t)
 
-        mid_out = torch.cat(need_concat, dim=1)  # (B, T-3, N, Cout)
+        # local_out 形状: (B, T_new, N, Cout)
+        # T_new = history - strides + 1
+        local_out = torch.cat(need_concat, dim=1)
 
-        # #打印 mid_out 和 data_res 的维度
-        # print(f"mid_out shape: {mid_out.shape}")
-        # print(f"data_res shape: {data_res.shape}")
-        #
-        # #确保 mid_out 和 data_res 的时间维度（T-3）相同
-        # if mid_out.shape[1] != data_res.shape[1]:
-        #     print("Warning: Time dimensions do not match!")
-        #
-        # # 如果 mid_out 的时间维度小于 data_res 的时间维度，可以对 data_res 进行裁剪
-        # if mid_out.shape[1] < data_res.shape[1]:
-        #     data_res = data_res[:, :mid_out.shape[1], :, :]  # 裁剪 data_res 的时间维度
-        #
-        # # 如果 data_res 的时间维度小于 mid_out 的时间维度，可以对 mid_out 进行裁剪
-        # elif mid_out.shape[1] > data_res.shape[1]:
-        #     mid_out = mid_out[:, :data_res.shape[1], :, :]  # 裁剪 mid_out 的时间维度
+        # ==================== 分支 2: [创新点二] 全局 Transformer ====================
+        # 输入 x: (B, T_old, N, Cin)
 
-        out = mid_out + data_res
-        del need_concat, batch_size
-        return out
+        # 1. 调整维度适应 Transformer: (B, N, T, C)
+        x_trans_in = x.permute(0, 2, 1, 3)
+
+        # 2. 全局 Attention 计算
+        # global_out: (B, N, T_old, Cin)
+        global_out = self.global_transformer(x_trans_in)
+
+        # 3. 时间维度对齐 (关键步骤)
+        # GCN 把时间 T 缩短了 (例如 12 -> 9)，Transformer 输出了 12。
+        # 我们只取 Transformer 输出的“后半部分”来和 GCN 对齐
+        # 或者取对应的切片。这里我们取与 GCN 对应的部分。
+        # local_out 的长度是 self.history - self.strides + 1
+        target_len = local_out.shape[1]
+
+        # 简单策略：取最后 target_len 个时间步 (假设我们要预测未来，最近的信息最重要)
+        # (B, N, T_target, Cin)
+        global_out = global_out[:, :, -target_len:, :]
+
+        # 4. 还原维度: (B, T_target, N, Cin)
+        global_out = global_out.permute(0, 2, 1, 3)
+
+        # 5. 通道对齐
+        if self.align_proj is not None:
+            global_out = self.align_proj(global_out)
+
+        # ==================== 双流融合 ====================
+        # Local (GCN) + Global (Transformer)
+        # 这是一个类似 ResNet 的加法融合
+        final_out = local_out + global_out
+
+        return final_out
+
+    # def forward(self, x, pattern_weights, mask=None):  # 原有方案
+    #     """
+    #     :param x: B, T, N, Cin    (x数据：表示有B个批次，每个批次有T个时间步，每个时间步有N个节点，输入特征维度是Cin)
+    #     :param mask: (N, N)
+    #     :return: B, T-3, N, Cout  (输出out数据:表示有B个批次，每个批次有T-3个时间步，每个时间步有N个节点，输出特征维度是Cout)
+    #     """
+    #     # 消融
+    #     if self.temporal_emb:   # x: B=64, T=12, N, Cin=64      temporal_embedding:1, history=12, 1, Cin=64
+    #         x = x + self.temporal_embedding     # x: B=64, T=12, N, Cin=64
+    #
+    #     if self.spatial_emb:    # 1, 1, N, Cin=64   spatial_embedding: 1, 1, N , Cin=64
+    #         x = x + self.spatial_embedding      # x: B=64, T=12, N, Cin=64
+    #
+    #
+    #     '''
+    #     下面代码对应论文中：两个二维的扩张卷积神经网络（捕获全局的）
+    #     '''
+    #     data_temp = x.permute(0, 3, 2, 1)                 # 交换位置x(B=64, Cin=64, N, T=12)
+    #     data_left = torch.sigmoid(self.conv1(data_temp))  # (64, 64, 358, 9)
+    #     data_right = torch.tanh(self.conv2(data_temp))    # (64, 64, 358, 9)
+    #     data_time_axis = data_left * data_right           # (64, 64, 358, 9)
+    #     data_res = data_time_axis.permute(0, 3, 2, 1)     # (64,9,358,64) 再次交换位置:(B,T-3,N,Cin)
+    #     # shape is (B, T-3, N, C)
+    #     #############################################
+    #
+    #     need_concat = []
+    #     batch_size = x.shape[0]  # 64
+    #
+    #     for i in range(self.history - self.strides + 1):
+    #         t = x[:, i: i+self.strides, :, :]  # 从x中提取一个滑动窗口:t(B, self.stride, N, Cin),这里stride=4
+    #         t = torch.reshape(t, shape=[batch_size, self.strides * self.num_of_vertices, self.in_dim])   #将t重塑为(B, self.stride*N, Cin)
+    #         # (B, 4*N, Cin)
+    #         t = self.STSGCMS[i](t.permute(1, 0, 2), pattern_weights, mask)  # (4*N, B, Cin) -> (N, B, Cout)
+    #         t = torch.unsqueeze(t.permute(1, 0, 2), dim=1)  # (N, B, Cout) -> (B, N, Cout) ->(B, 1, N, Cout)
+    #         need_concat.append(t)
+    #
+    #     mid_out = torch.cat(need_concat, dim=1)  # (B, T-3, N, Cout)
+    #     out = mid_out + data_res
+    #     del need_concat, batch_size
+    #     return out
 
 
 class output_layer(nn.Module):
@@ -328,8 +611,8 @@ class output_layer(nn.Module):
         # return out2.permute(0, 2, 1)  # B, horizon, N
 
 
-class STFGNN(nn.Module):
-    print("-------------------------进入STFGNN类----------------------------")
+class DAGCN(nn.Module):
+    print("-------------------------进入DAGCN类----------------------------")
     def __init__(self, config, data_feature):  # config:模型配置参数  data_feature:数据的特征信息
         """
 
@@ -347,14 +630,7 @@ class STFGNN(nn.Module):
         :param horizon:预测时间步长
         :param strides:滑动窗口步长，local时空图使用几个时间步构建的，默认为4
         """
-
-        '''
-        1，super(STFGNN, self):STFGNN是子类的名字，self是当前对象的引用。这样组合告诉python要在STFGNN的上下文中，调用它的父类的方法
-        2，__init__():这是父类nn.Module的构造函数,调用之后来初始化父类中的所有成员变量和属性
-        '''
-        super(STFGNN, self).__init__()
-
-        # self在”=“左侧:表示正在定义或者修改类实例的属性
+        super(DAGCN, self).__init__()
         self.config = config
         self.data_feature = data_feature
         self.scaler = data_feature["scaler"]    # std: Z-score 标准化
@@ -375,6 +651,7 @@ class STFGNN(nn.Module):
         spatial_emb = self.config.get("spatial_emb", True)  # True 使用空间嵌入
         horizon = self.config.get("horizon", 24)    # 12 输出的预测时间步长
         strides = self.config.get("strides", 4)  # 4 滑动窗口步长 用于控制每次处理的时间步数量
+        # pattern = self.data_feature["pattern"]
 
         # 将局部变量存储为实例属性
         self.adj = adj  # (4N，4N）
@@ -390,8 +667,37 @@ class STFGNN(nn.Module):
         self.strides = 4
         # self.strides = 3
 
-        # 定义一个线性层，并存储为实例属性
-        self.First_FC = nn.Linear(in_dim, first_layer_embedding_size, bias=True)        # in_dim=1, first_layer_embedding_size=64   1-->64
+        self.input_proj = nn.Linear(1, 12)
+
+        # [新增] 从 data_feature 获取 patterns
+        # 注意：要送到 GPU 上 (假设 device 是 self.adj.device 的位置，后续 forward 会自动处理，但最好这里转一下)
+        if "patterns" in data_feature:
+            # [核心修改] 使用 nn.Parameter 包装，并设置为不可训练
+            # 这样 model.cuda() 时，它会自动跟着去 GPU
+            self.patterns = nn.Parameter(data_feature["patterns"], requires_grad=False)
+        else:
+            raise ValueError("Data feature missing 'patterns'!")
+
+        # self.First_FC = nn.Linear(in_dim, first_layer_embedding_size, bias=True)
+
+        # ----------------------------------------
+        # [创新点三修改] 替换原来的 self.First_FC
+        # 原代码: self.First_FC = nn.Linear(in_dim, first_layer_embedding_size, bias=True)
+
+        if isinstance(self.adj, torch.Tensor):
+            spatial_adj = self.adj[:self.num_of_vertices, :self.num_of_vertices].cpu().numpy()
+        else:
+            spatial_adj = self.adj[:self.num_of_vertices, :self.num_of_vertices]
+
+        self.embedding_layer = AdvancedDataEmbedding(
+            input_dim=in_dim,
+            embed_dim=first_layer_embedding_size,
+            adj_mx=spatial_adj,  # [修改] 传入切片后的 307x307 矩阵
+            num_nodes=self.num_of_vertices,
+            dropout=0.1
+        )
+        # ----------------------------------------
+
         self.STSGCLS = nn.ModuleList()
         self.STSGCLS.append(
             STSGCL(
@@ -403,7 +709,8 @@ class STFGNN(nn.Module):
                 strides=self.strides,
                 activation=self.activation,
                 temporal_emb=self.temporal_emb,
-                spatial_emb=self.spatial_emb
+                spatial_emb=self.spatial_emb,
+                patterns=self.patterns
             )
         )
 
@@ -426,7 +733,8 @@ class STFGNN(nn.Module):
                     strides=self.strides,
                     activation=self.activation,
                     temporal_emb=self.temporal_emb,
-                    spatial_emb=self.spatial_emb
+                    spatial_emb=self.spatial_emb,
+                    patterns=self.patterns
                 )
             )
             history -= (self.strides - 1)   # 9->6, 6->3 更新history
@@ -456,14 +764,33 @@ class STFGNN(nn.Module):
             self.mask = None
 
     def forward(self, x):
-        """
-        :param x: (B, Tin, N, Cin) B:batch  Tin:history   N:num_of_vertices   Cin:in_dim
-        :return: (B, Tout, N)
-        """
-        x = torch.relu(self.First_FC(x))  # B=64, Tin=12, N, Cin=1 -> (64,12,N, Cout=64)、
+        # --- [新增] 第一步：计算 Pattern Weights ---
+        # x: (B, 12, N, 1) -> permute -> (B, N, 12, 1)
+        # 我们取输入的特征，或者简单的 reshape
+        # 这里假设输入序列长度就是 12 (history)，pattern 长度也是 12
+
+        # 简单归一化输入，以便和 Z-score 的 patterns 匹配
+        x_norm = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-5)
+        # 取第0个特征 (B, T, N) -> (B, N, T)
+        x_in = x_norm[..., 0].permute(0, 2, 1)
+
+        # 计算相似度: (B, N, T) @ (K, T).T -> (B, N, K)
+        # self.patterns 是 (K, 12)
+        # 注意：self.patterns 需要在该类里访问到，确保它在 __init__ 里被保存了
+        score = torch.matmul(x_in, self.patterns.t())
+        pattern_weights = torch.softmax(score, dim=-1)  # (B, N, K)
+
+        # --- 步骤 2: 数据嵌入 (创新点三修改) ---
+        # [修改] 不再使用 self.First_FC(x)
+        # 而是使用增强型 embedding_layer
+        x = self.embedding_layer(x)
+        # 注意: AdvancedDataEmbedding 内部已经包含了 Input Projection 和 Feature Fusion
+        # 所以 x 现在的维度已经是 (B, T, N, 64) 了
+
+        # x = torch.relu(self.First_FC(x))  # B=64, Tin=12, N, Cin=1 -> (64,12,N, Cout=64) 这一行可以去掉，因为 Embedding 类里通常不需要 ReLU，或者已经在内部处理了
         # print("经过定义的First_FC层之后x的数据形状：",x.size())  # pems08_30:([64,12,170,64]) pems08_10:([64,12,170,64])
         for model in self.STSGCLS:
-            x = model(x, self.mask)
+            x = model(x, pattern_weights ,self.mask)
         need_concat = []
         for i in range(self.horizon):   # 12 对每一个时间步长
             out_step = self.predictLayer[i](x)  # (B, 1, N, 1) 每个时间步的预测
@@ -472,6 +799,5 @@ class STFGNN(nn.Module):
         del need_concat
         return out
 
-    print("-------------------------退出STFGNN类----------------------------")
 
 
